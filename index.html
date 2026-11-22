@@ -176,9 +176,11 @@ tr.new:hover td,tr.miss:hover td{filter:brightness(.96)}
           <select id="daySel"></select>
         </label>
         <button class="btn danger sm" id="dayDel" type="button" disabled>حذف اليومية</button>
+        <button class="btn ghost sm" id="cloudAll" type="button">☁️ مزامنة كل اليوميات مع Supabase</button>
         <div class="dinfo">
           <div class="note" id="dayInfo" hidden></div>
           <div class="note" id="histWarn" hidden></div>
+          <div class="note" id="cloudInfo" hidden></div>
         </div>
       </div>
       <nav class="tabs" id="views" role="tablist" aria-label="الصفحات">
@@ -457,9 +459,35 @@ const dbAll=()=>tx('readonly',s=>s.getAll());
 const dbPut=rec=>tx('readwrite',s=>s.put(rec));
 const dbDel=id=>tx('readwrite',s=>s.delete(id));
 const dbGet=id=>tx('readonly',s=>s.get(id));
+
+/* نسخة سحابية في Supabase: اليوميات (sales_days) وأصنافها (sales_day_items) وقائمة المنتجات (sales_catalog).
+   الحفظ المحلي (IndexedDB) يبقى هو الأساس؛ فشل السحابة (لا إنترنت مثلًا) لا يوقف العمل ويظهر تنبيه فقط. */
+const SB_URL='https://qvrhiuziememutmafsak.supabase.co', SB_KEY='sb_publishable_WEaudIpaOBEAJkkhziDEJA_3hCJtQIm';
+const CIDS=new Map(); // رقم اليومية المحلي => معرّف اليومية في السحابة (uuid)
+const uuid=()=>typeof crypto!=='undefined'&&crypto.randomUUID?crypto.randomUUID():'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c==='x'?r:(r&3|8)).toString(16)});
+async function sb(path,method,body,prefer){
+  const r=await fetch(SB_URL+'/rest/v1/'+path,{method:method||'GET',headers:Object.assign({apikey:SB_KEY,'Content-Type':'application/json'},prefer?{Prefer:prefer}:{}),body:body==null?undefined:JSON.stringify(body)});
+  if(!r.ok){let m='';try{m=(await r.text()).slice(0,160)}catch(e){} throw new Error('HTTP '+r.status+' '+m)}
+}
+function cloudNote(m,bad){const e=$('cloudInfo');e.textContent=m||'';e.hidden=!m;e.style.color=bad?'var(--bad)':''}
+async function cloud(fn,okMsg){try{await fn();if(okMsg)cloudNote(okMsg);return true}catch(e){cloudNote('تعذر الحفظ في Supabase: '+e.message,true);return false}}
+const cloudDayRow=d=>({id:d.cid,label:d.label,day_date:d.date,note:d.note||'',filename:d.filename||null,file_size:d.size||null,sheet:d.sheet||null,orders:d.orders||0,items_count:d.items||0,pieces:d.pieces||0,saved_at:new Date(d.savedAt||Date.now()).toISOString()});
+async function cloudPushItems(cid,itemRows,stock){
+  const rows=itemRows.map(i=>{const s=stock&&stock[i.name], n=(s==null||s==='')?NaN:Number(s);
+    return{day_id:cid,name:i.name,pending:i['قيد'],drum:i['قيد الدرج'],done:i['تم'],total:i.total,new_stock:Number.isFinite(n)?n:null}});
+  for(let k=0;k<rows.length;k+=500) await sb('sales_day_items?on_conflict=day_id,name','POST',rows.slice(k,k+500),'resolution=merge-duplicates,return=minimal');
+}
+async function cloudPushDay(d,rr){ // اليومية ثم أصنافها (الأصناف تعتمد على وجود اليومية)
+  await sb('sales_days?on_conflict=id','POST',[cloudDayRow(d)],'resolution=merge-duplicates,return=minimal');
+  await cloudPushItems(d.cid,rr.itemRows,d.stock);
+}
+async function cloudPushCatalog(recs){
+  const rows=recs.map(r=>({name:r.name,first_day_id:CIDS.get(r.firstDayId)||null,first_label:r.firstLabel||null,added_at:new Date(r.addedAt||Date.now()).toISOString()}));
+  for(let k=0;k<rows.length;k+=500) await sb('sales_catalog?on_conflict=name','POST',rows.slice(k,k+500),'resolution=merge-duplicates,return=minimal');
+}
 (async()=>{try{DB=await dbOpen();$('histWarn').hidden=true;await loadCatalog();await refreshDays();backfillP=backfillCatalog()}catch(e){$('histWarn').hidden=false;$('histWarn').textContent='الحفظ غير متاح في هذا المتصفح (ربما نافذة خاصة). لن تُسجل اليوميات.'}})();
 
-async function refreshDays(){try{DAYS=await dbAll()}catch(e){DAYS=[]}renderHist()}
+async function refreshDays(){try{DAYS=await dbAll()}catch(e){DAYS=[]}DAYS.forEach(d=>{if(d.cid)CIDS.set(d.id,d.cid)});renderHist()}
 function renderHist(){
   const sel=$('daySel');
   const list=DAYS.slice().sort((a,b)=>String(b.date||'').localeCompare(String(a.date||''))||(b.savedAt||0)-(a.savedAt||0));
@@ -473,13 +501,43 @@ function renderHist(){
   const del=$('dayDel');del.disabled=!cur;del.dataset.arm='';del.textContent='حذف اليومية';
 }
 $('daySel').onchange=e=>{const v=e.target.value;if(v) openDay(+v)};
+/* رفع كل اليوميات المحفوظة محليًا (بما فيها القديمة) وقائمة المنتجات إلى Supabase؛ آمن للتكرار لأنه تحديث لا إضافة */
+$('cloudAll').onclick=async function(){
+  const b=this; b.disabled=true;
+  try{
+    await refreshDays();
+    const list=DAYS.slice().sort((a,b)=>String(a.date||'').localeCompare(String(b.date||''))||(a.savedAt||0)-(b.savedAt||0));
+    if(!list.length){cloudNote('لا توجد يوميات محفوظة لمزامنتها.');return}
+    let n=0, bad=0;
+    for(const d of list){
+      cloudNote('جاري المزامنة... '+n+' / '+list.length);
+      await new Promise(r=>setTimeout(r,0));
+      try{
+        if(!d.cid){d.cid=uuid(); await dbPut(d)}
+        CIDS.set(d.id,d.cid);
+        const wb=XLSX.read(new Uint8Array(d.buf),{type:'array'});
+        const nm=wb.SheetNames.includes(d.sheet)?d.sheet:(wb.SheetNames.includes('ALL')?'ALL':wb.SheetNames[0]);
+        const rr=analyze(XLSX.utils.sheet_to_json(wb.Sheets[nm],{header:1,defval:'',raw:true}),opts());
+        await cloudPushDay(d,rr); n++;
+      }catch(e){bad++; if(/HTTP|fetch|network/i.test(e.message)) throw e} // يومية تالفة: نتخطاها، وخطأ الشبكة يوقف العملية
+    }
+    if(backfillP) await backfillP;
+    if(CAT.size) await cloudPushCatalog([...CAT.values()]);
+    cloudNote('تمت مزامنة '+n+' يومية و'+CAT.size+' منتج مع Supabase'+(bad?' (تعذر '+bad+' يومية تالفة)':''),bad>0);
+  }catch(e){cloudNote('تعذرت المزامنة: '+e.message,true)}
+  finally{b.disabled=false}
+};
 $('dayDel').onclick=function(){
   if(CURID==null) return;
   if(this.dataset.arm){delDay(CURID);return}
   this.dataset.arm=1;this.textContent='اضغط للتأكيد';const b=this;setTimeout(()=>{b.dataset.arm='';b.textContent='حذف اليومية'},3500);
 };
 
-async function delDay(id){try{await dbDel(id)}catch(e){showErr('تعذر الحذف: '+e.message)} if(CURID===id){CURID=null;$('curday').textContent=''} refreshDays()}
+async function delDay(id){
+  const cid=CIDS.get(id); let ok=true;
+  try{await dbDel(id)}catch(e){ok=false;showErr('تعذر الحذف: '+e.message)}
+  if(ok&&cid){CIDS.delete(id);cloud(()=>sb('sales_days?id=eq.'+cid,'DELETE',null,'return=minimal'),'حُذفت اليومية من Supabase أيضًا')} // أصنافها تُحذف تلقائيًا (cascade)
+  if(CURID===id){CURID=null;$('curday').textContent=''} refreshDays()}
 async function openDay(id){
   try{const d=await dbGet(id);if(!d)return;
     showErr('');WB=XLSX.read(new Uint8Array(d.buf),{type:'array'});FILENAME=d.filename;CURID=d.id;CURLABEL=d.label+' ('+d.date+')';STOCK=d.stock||{};
@@ -527,9 +585,11 @@ $('saveBox').onsubmit=async e=>{
   if(!R) return; // فشل التحليل: لا نحفظ ملفًا غير صالح
   if(DB){
     try{
-      const id=await dbPut({label,date,note:$('dayNote').value.trim(),filename:PENDING.name,size:PENDING.size,sheet:$('sheet').value,savedAt:Date.now(),buf:PENDING.buf,stock:{},
-        orders:R.totals.processed,items:R.totals.items,pieces:R.totals.pieces});
-      CURID=id;
+      const rec={label,date,note:$('dayNote').value.trim(),filename:PENDING.name,size:PENDING.size,sheet:$('sheet').value,savedAt:Date.now(),buf:PENDING.buf,stock:{},
+        orders:R.totals.processed,items:R.totals.items,pieces:R.totals.pieces,cid:uuid()};
+      const id=await dbPut(rec);
+      CURID=id; CIDS.set(id,rec.cid);
+      await cloud(()=>cloudPushDay(rec,R),'حُفظت اليومية وأصنافها في Supabase'); // قبل قائمة المنتجات لأنها تشير إلى اليومية
     }catch(err){showErr('تم التحليل لكن تعذر الحفظ: '+err.message)}
   }else showErr('تم التحليل لكن الحفظ غير متاح في هذا المتصفح.');
   CURLABEL=label+' ('+date+')'; PENDING=null; showSave(false); file.value='';
@@ -634,7 +694,8 @@ function saveStockSoon(){
   clearTimeout(stkT);
   stkT=setTimeout(async()=>{
     if(!DB||id==null) return;
-    try{const d=await dbGet(id); if(!d) return; d.stock=snap; await dbPut(d)}
+    try{const d=await dbGet(id); if(!d) return; d.stock=snap; await dbPut(d);
+      if(d.cid&&R&&CURID===id) cloud(()=>cloudPushItems(d.cid,R.itemRows,snap));}
     catch(e){showErr('تعذر حفظ المخزون الجديد: '+e.message)}
   },500);
 }
@@ -662,6 +723,7 @@ async function syncCatalog(){
     const rec={name:it.name,firstDayId:id,firstLabel:label,addedAt:Date.now()}; CAT.set(it.name,rec); recs.push(rec);
   }
   if(recs.length&&DB){try{await catPut(recs)}catch(e){showErr('تعذر حفظ قائمة المنتجات: '+e.message)}}
+  if(recs.length&&CURID!=null&&!PENDING) await cloud(()=>cloudPushCatalog(recs)); // PENDING: ملف لم يُحفظ بعد، لا نرفع منتجاته
   renderCatalog();
 }
 /* أول تشغيل بعد التحديث: نبني القائمة من اليوميات المحفوظة سابقًا بالترتيب الزمني ليُنسب كل صنف لأول يومية ظهر فيها */
