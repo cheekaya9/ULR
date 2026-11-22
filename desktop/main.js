@@ -6,7 +6,7 @@ const https = require('https');
 const crypto = require('crypto');
 
 // ====== إعدادات ======
-const UPDATE_URL = 'https://basemelsayed540.github.io/Aziz/index.html';
+const UPDATE_URL = 'https://raw.githubusercontent.com/cheekaya9/ULR/main/index.html';
 const CHECK_EVERY_MS = 30 * 60 * 1000;
 const MIN_SIZE = 200 * 1024;                       // حماية من صفحة خطأ/ملف ناقص
 const MARKERS = ['محلل مبيعات', 'id="drop"', 'XLSX'];  // لازم تكون موجودة في أي نسخة سليمة
